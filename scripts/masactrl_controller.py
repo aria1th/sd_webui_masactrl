@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import enum
+from functools import reduce
 from inspect import isfunction
 
+from scripts.math_utils import get_closest_defactorization
 # from diffusers.utils import deprecate
 from ldm.modules.diffusionmodules.openaimodel import UNetModel
 import torch
@@ -795,7 +797,7 @@ class MasaController:
         return current_mask, current_kv, self.recon_mask_threshold
 
 
-    def masa_unet_signal(self, x, timesteps):
+    def masa_unet_signal(self, x, timesteps, is_hires:bool=False):
         last_timestep = self.current_timestep
         current_timestep = timesteps[0].item()
         if last_timestep == current_timestep:
@@ -805,7 +807,8 @@ class MasaController:
             self.current_timestep = current_timestep
 
         timestep_str_key = str(self.current_timestep)
-        self.current_latent_size = x.shape[-2:]
+        if self.current_latent_size is None or self.current_latent_size == (0,0):
+            self.current_latent_size = x.shape[-2:]
         if self.mode == MasaControllerMode.LOGGING or self.mode == MasaControllerMode.LOGRECON:
             if timestep_str_key not in self.logged_xattn_map_data_suite:
                 self.logged_xattn_map_data_suite[timestep_str_key] = {}
@@ -834,7 +837,21 @@ class MasaController:
                     attn_map = attn_map.mean(0)
                     # xattn_maps_of_interest[i] = attn_map
                     res_h, res_w = self.current_latent_size
-                    xattn_maps_of_interest[i] = attn_map.reshape(math.ceil(res_h/4), math.ceil(res_w/4))
+                    attn_map_total_size = reduce(lambda x, y: x * y, attn_map.shape) # such as 16x16
+                    current_res_h, current_res_w = get_closest_defactorization(res_h, res_w, attn_map_total_size) # get resized resolution
+                    # if size is different, we need to interpolate
+                    if current_res_h != res_h or current_res_w != res_w:
+                        # correct shaped attn_map, from 1d to 2d
+                        print(attn_map.shape)
+                        print(current_res_h, current_res_w)
+                        attn_map = attn_map.reshape(current_res_h, current_res_w)
+                        print(attn_map.shape) # [16, 24] for example, resize to [24, 36]
+                        attn_map = F.interpolate(attn_map.unsqueeze(0).unsqueeze(0), size=(res_h, res_w), mode='bilinear', align_corners=False)
+                        # reshape again to 1d shape [24*36]
+                        attn_map = attn_map.reshape(-1)
+                        print(attn_map.shape)
+                    # then we can reshape
+                    xattn_maps_of_interest[i] = attn_map
 
                 attn_maps_aggregate = torch.stack(xattn_maps_of_interest, dim=0).mean(0)
 
@@ -866,15 +883,21 @@ class MasaController:
                     self.log_recon = False
 
                 # order matters because of start_layer
-
                 self.recon_params_init(masa_start_step, masa_start_layer, mask_threshold)
                 self.recon_attach_sattn()
         if mode is not MasaControllerMode.IDLE:
             self.foreground_indexes = foreground_indexes
-
             self.unet_proxy.attach()
 
-    def recon_params_init(self, masa_start_step, masa_start_layer,mask_threshold):
+    def recon_params_init(self, masa_start_step:int, masa_start_layer:int,mask_threshold:float):
+        """
+        :param masa_start_step: start timestep for reconstruction
+        :param masa_start_layer: start layer for reconstruction
+        :param mask_threshold: threshold for reconstruction mask
+        """
+        ref_keys_list = list(self.recon_averaged_xattn_map_reference.keys())
+        if len(ref_keys_list) == 0 or masa_start_step >= 0 and masa_start_step >= len(ref_keys_list):
+            raise RuntimeError(f'Invalid start timestep {masa_start_step} for reconstruction, len of ref keys {len(ref_keys_list)}')
         self.start_timestep = float(list(self.recon_averaged_xattn_map_reference.keys())[masa_start_step])
         self.start_layer = masa_start_layer
         self.recon_mask_threshold = mask_threshold
