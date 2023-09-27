@@ -99,6 +99,7 @@ class ProxyReconMasaSattn(object):
             return attention_mask
 
         if attention_mask.shape[-1] != target_length:
+            print(f"Attention mask shape: {attention_mask.shape} does not match target length: {target_length}")
             if attention_mask.device.type == "mps":
                 # HACK: MPS: Does not support padding by greater than dimension of input tensor.
                 # Instead, we can manually construct the padding tensor.
@@ -252,18 +253,44 @@ class ProxyReconMasaSattn(object):
         head_dim = inner_dim // h
 
         if mask is not None:
-            mask = self.prepare_attention_mask(mask, sequence_length, batch_size)
+            mask = self.prepare_attention_mask(mask, sequence_length, batch_size) # 1d shape, make 2d then interpolate -> recover 1d again
+            print(f"mask shape before: {mask.shape}")
+            print(f"sequence length: {sequence_length}")
+            # interpolate here
+            current_h, current_w = self.controller.current_latent_size
+            print(f"current_h: {current_h}, current_w: {current_w}")
+            # get closest defactorization of current_h and current_w with 384 in q_in.shape[1]
+            res_h, res_w = get_closest_defactorization(current_h, current_w, mask.shape[-1])
+            print(f"res_h: {res_h}, res_w: {res_w}")
+            # current_h should be 4x of res_h. if not, multiply current_h and current_w
+            if current_h != res_h * 4 and current_w != res_w * 4:
+                print("current_h and current_w not 4x of res_h and res_w, multiplying")
+                scale_to_h = (res_h * 4) / current_h
+                scale_to_w = (res_w * 4) / current_w
+                print(f"scale_to_h: {scale_to_h}, scale_to_w: {scale_to_w}")
+                current_h, current_w = int(current_h * scale_to_h), int(current_w * scale_to_w)
+            # reshape mask to 2d
+            mask = mask.view(res_h, res_w)
+            # interpolate
+            mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0), (current_h, current_w)).flatten()
             if len(mask.shape) == 1 and mask.shape[0] == sequence_length:
                 # we are getting a slice of the mask covering sequence_length, need to repeat in all other dimensions
                 mask = mask.unsqueeze(-1).repeat(batch_size, h, 1, sequence_length)
+            elif batch_size * self.heads * sequence_length == mask.shape[0]:
+                print("interpolating mask shape")
+                mask = mask.view(batch_size, self.heads, -1, sequence_length)
             else:
+                assert batch_size * self.heads * sequence_length == mask.shape[0], f"mask shape does not match, batch_size: {batch_size}, heads: {self.heads}, sequence_length: {sequence_length}, mask.shape: {mask.shape}"
+                print("recovering mask shape")
                 mask = mask.view(batch_size, self.heads, -1, mask.shape[-1])
+            print(f"mask shape after: {mask.shape}")
 
 
         q_in = self.to_q(x)
 
         if mask is not None:
             mask = mask.to(q_in.dtype)
+            
 
         if external_k_in is None or external_v_in is None:
             context = default(context, x)
@@ -298,7 +325,15 @@ class ProxyReconMasaSattn(object):
         dtype = q.dtype
         if shared.opts.upcast_attn:
             q, k, v = q.float(), k.float(), v.float()
-
+        
+        # print each shapes
+        print(f"q shape: {q.shape}") #2, 8, 384, 160
+        print(f"k shape: {k.shape}") #2, 8, 384, 160
+        print(f"v shape: {v.shape}") #2, 8, 384, 160
+        if mask is not None:
+            print(f"mask shape: {mask.shape}")
+        else:
+            print(f"mask shape: {mask}")
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         hidden_states = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
@@ -842,14 +877,18 @@ class MasaController:
                     # if size is different, we need to interpolate
                     if current_res_h != res_h or current_res_w != res_w:
                         # correct shaped attn_map, from 1d to 2d
-                        print(attn_map.shape)
+                        print(f"original shape {attn_map.shape}")
                         print(current_res_h, current_res_w)
                         attn_map = attn_map.reshape(current_res_h, current_res_w)
-                        print(attn_map.shape) # [16, 24] for example, resize to [24, 36]
-                        attn_map = F.interpolate(attn_map.unsqueeze(0).unsqueeze(0), size=(res_h, res_w), mode='bilinear', align_corners=False)
+                        print(attn_map.shape) # [16, 24] for example, resize to [24, 36] not [1, 1, 24, 36]
+                        attn_map = F.interpolate(attn_map.unsqueeze(0).unsqueeze(0), size=(res_h//4, res_w//4), mode='bilinear', align_corners=False)
+                        # check if we need to reshape back to 2d
+                        if len(attn_map.shape) == 4:
+                            attn_map = attn_map.squeeze(0).squeeze(0)
+                        else:
+                            attn_map = attn_map.squeeze(0)
                         # reshape again to 1d shape [24*36]
-                        attn_map = attn_map.reshape(-1)
-                        print(attn_map.shape)
+                        print(f"interpolated shape {attn_map.shape}")
                     # then we can reshape
                     xattn_maps_of_interest[i] = attn_map
 
