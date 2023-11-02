@@ -746,8 +746,10 @@ class MasaController:
     def report_xattn(self, name, xattn_map_data_dict):
         timestep_str_key = str(self.current_timestep)
         if self.current_timestep_unet_pass == 0:
-
-            self.logged_xattn_map_data_suite[timestep_str_key][name] = xattn_map_data_dict
+            try:
+                self.logged_xattn_map_data_suite[timestep_str_key][name] = xattn_map_data_dict
+            except:
+                print('debug for xattn report overwrite')
         # else:
         #     print('debug for unmatched uncond pass')
 
@@ -762,7 +764,10 @@ class MasaController:
         sattn_map_data_dict_cpu = {
             key: value.cpu() for key, value in sattn_map_data_dict.items()
         }
-        self.logged_sattn_data_suite[timestep_str_key][self.current_timestep_unet_pass][name] = sattn_map_data_dict_cpu
+        try:
+            self.logged_sattn_data_suite[timestep_str_key][self.current_timestep_unet_pass][name] = sattn_map_data_dict_cpu
+        except:
+            print('debug for sattn report overwrite')
         del sattn_map_data_dict
 
 
