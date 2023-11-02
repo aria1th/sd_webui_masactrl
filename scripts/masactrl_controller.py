@@ -633,14 +633,13 @@ class ProxyMasaUNetModel(object):
         self.attached = False
         self.controller = controller
 
-
-
-
     def __getattr__(self, attr):
         if attr not in ['org_module', 'org_forward', 'attached', 'controller'] and self.attached:
             return getattr(self.org_module, attr)
 
     def attach(self):
+        if self.attached:
+            return
         if self.org_forward is not None:
             return
         self.org_forward = self.org_module.forward
@@ -648,6 +647,8 @@ class ProxyMasaUNetModel(object):
         self.attached = True
 
     def detach(self):
+        if not self.attached:
+            return
         if self.org_forward is None:
             return
         self.org_module.forward = self.org_forward
@@ -701,11 +702,6 @@ class MasaController:
         self.foreground_indexes = [1]
         self.current_timestep_unet_pass = 0
 
-
-
-
-
-
     def logging_attach_all(self):
         for name, module in self.proxy_xattn_modules.items():
             module.attach()
@@ -737,17 +733,13 @@ class MasaController:
         for name, module in self.proxy_sattn_modules.items():
             module.detach()
 
-
-
-
-
-
-
     def report_xattn(self, name, xattn_map_data_dict):
         timestep_str_key = str(self.current_timestep)
         if self.current_timestep_unet_pass == 0:
-
-            self.logged_xattn_map_data_suite[timestep_str_key][name] = xattn_map_data_dict
+            try:
+                self.logged_xattn_map_data_suite[timestep_str_key][name] = xattn_map_data_dict
+            except (KeyError, IndexError):
+                print("Wrongly reported xattn data, skipping...")
         # else:
         #     print('debug for unmatched uncond pass')
 
@@ -762,10 +754,15 @@ class MasaController:
         sattn_map_data_dict_cpu = {
             key: value.cpu() for key, value in sattn_map_data_dict.items()
         }
-        self.logged_sattn_data_suite[timestep_str_key][self.current_timestep_unet_pass][name] = sattn_map_data_dict_cpu
+        try:
+            self.logged_sattn_data_suite[timestep_str_key][self.current_timestep_unet_pass][name] = sattn_map_data_dict_cpu
+        except (KeyError, IndexError):
+            print("Wrongly reported sattn data, skipping...")
         del sattn_map_data_dict
 
-
+    def clear_reports(self):
+        self.logged_xattn_map_data_suite.clear()
+        self.logged_sattn_data_suite.clear()
 
 
     def recon_attach_sattn(self):
@@ -871,8 +868,9 @@ class MasaController:
                 self.recon_attach_sattn()
         if mode is not MasaControllerMode.IDLE:
             self.foreground_indexes = foreground_indexes
-
             self.unet_proxy.attach()
+        else:
+            self.clear_reports()
 
     def recon_params_init(self, masa_start_step, masa_start_layer,mask_threshold):
         self.start_timestep = float(list(self.recon_averaged_xattn_map_reference.keys())[masa_start_step])
@@ -891,6 +889,8 @@ class MasaController:
             case MasaControllerMode.LOGRECON:
                 self.recon_detach_all()
                 self.logging_detach_xattn()
+            case MasaControllerMode.IDLE:
+                self.clear_reports()
 
 
 
