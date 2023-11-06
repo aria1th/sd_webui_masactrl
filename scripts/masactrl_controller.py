@@ -19,6 +19,7 @@ from einops import rearrange, repeat
 import os
 import math
 import numpy as np
+from scripts.reshape_utils import find_original_values, functional_reshape_values
 
 
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
@@ -150,7 +151,7 @@ class ProxyReconMasaSattn(object):
                 bg_attn_mask = torch.zeros_like(scaled_mask)
                 bg_attn_mask[scaled_mask >= masa_mask_threshold] = torch.finfo(masa_kv['k_in'].dtype).min
 
-                if sequence_length > 20000:
+                if sequence_length > 20000: 
                     fg_sattn_out = self.masa_split_sattn_forward(x, context, fg_attn_mask,
                                                                                  masa_kv['k_in'], masa_kv['v_in'])
                     bg_sattn_out = self.masa_split_sattn_forward(x, context, bg_attn_mask,
@@ -300,6 +301,9 @@ class ProxyReconMasaSattn(object):
             q, k, v = q.float(), k.float(), v.float()
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
+        # shape of q, k, v, mask should be same
+        q, k, v, mask = functional_reshape_values(q, k, v, mask)
+        #print(f'q shape:{q.shape}, k shape:{k.shape}, v shape:{v.shape}, mask shape:{mask.shape if mask is not None else None}')
         hidden_states = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
         )
@@ -702,6 +706,9 @@ class MasaController:
         self.recon_logged_sattn_kv_suite = {}
         self.foreground_indexes = [1]
         self.current_timestep_unet_pass = 0
+        
+        self.logged_h = 0
+        self.logged_w = 0
 
 
 
@@ -748,8 +755,10 @@ class MasaController:
     def report_xattn(self, name, xattn_map_data_dict):
         timestep_str_key = str(self.current_timestep)
         if self.current_timestep_unet_pass == 0:
-
-            self.logged_xattn_map_data_suite[timestep_str_key][name] = xattn_map_data_dict
+            try:
+                self.logged_xattn_map_data_suite[timestep_str_key][name] = xattn_map_data_dict
+            except:
+                print('debug for xattn report overwrite')
         # else:
         #     print('debug for unmatched uncond pass')
 
@@ -764,7 +773,10 @@ class MasaController:
         sattn_map_data_dict_cpu = {
             key: value.cpu() for key, value in sattn_map_data_dict.items()
         }
-        self.logged_sattn_data_suite[timestep_str_key][self.current_timestep_unet_pass][name] = sattn_map_data_dict_cpu
+        try:
+            self.logged_sattn_data_suite[timestep_str_key][self.current_timestep_unet_pass][name] = sattn_map_data_dict_cpu
+        except:
+            print('debug for sattn report overwrite')
         del sattn_map_data_dict
 
 
@@ -837,21 +849,14 @@ class MasaController:
                     attn_map = attn_map.mean(0)
                     # xattn_maps_of_interest[i] = attn_map
                     res_h, res_w = self.current_latent_size
-                    attn_map_total_size = reduce(lambda x, y: x * y, attn_map.shape) # such as 16x16
-                    current_res_h, current_res_w = get_closest_defactorization(res_h, res_w, attn_map_total_size) # get resized resolution
-                    # if size is different, we need to interpolate
-                    if current_res_h != res_h or current_res_w != res_w:
-                        # correct shaped attn_map, from 1d to 2d
-                        print(attn_map.shape)
-                        print(current_res_h, current_res_w)
-                        attn_map = attn_map.reshape(current_res_h, current_res_w)
-                        print(attn_map.shape) # [16, 24] for example, resize to [24, 36]
-                        attn_map = F.interpolate(attn_map.unsqueeze(0).unsqueeze(0), size=(res_h, res_w), mode='bilinear', align_corners=False)
-                        # reshape again to 1d shape [24*36]
-                        attn_map = attn_map.reshape(-1)
-                        print(attn_map.shape)
-                    # then we can reshape
-                    xattn_maps_of_interest[i] = attn_map
+                    # 29, 19 is invalid for input of size 384 error
+                    #print(f'xattn map shape: {attn_map.shape}')
+                    #print(f'current latent size: {self.current_latent_size}')
+                    #print(f'target res: {math.ceil(res_h/4)}, {math.ceil(res_w/4)}')
+                    logged_h, logged_w = find_original_values(math.ceil(res_h/4), math.ceil(res_w/4), attn_map.shape[0])
+                    self.logged_h = logged_h
+                    self.logged_w = logged_w
+                    xattn_maps_of_interest[i] = attn_map.reshape(logged_h, logged_w)
 
                 attn_maps_aggregate = torch.stack(xattn_maps_of_interest, dim=0).mean(0)
 
@@ -889,16 +894,11 @@ class MasaController:
             self.foreground_indexes = foreground_indexes
             self.unet_proxy.attach()
 
-    def recon_params_init(self, masa_start_step:int, masa_start_layer:int,mask_threshold:float):
-        """
-        :param masa_start_step: start timestep for reconstruction
-        :param masa_start_layer: start layer for reconstruction
-        :param mask_threshold: threshold for reconstruction mask
-        """
-        ref_keys_list = list(self.recon_averaged_xattn_map_reference.keys())
-        if len(ref_keys_list) == 0 or masa_start_step >= 0 and masa_start_step >= len(ref_keys_list):
-            raise RuntimeError(f'Invalid start timestep {masa_start_step} for reconstruction, len of ref keys {len(ref_keys_list)}')
-        self.start_timestep = float(list(self.recon_averaged_xattn_map_reference.keys())[masa_start_step])
+    def recon_params_init(self, masa_start_step, masa_start_layer,mask_threshold):
+        if len(self.recon_averaged_xattn_map_reference):
+            self.start_timestep = float(list(self.recon_averaged_xattn_map_reference.keys())[masa_start_step])
+        else:
+            self.start_timestep = 900.0
         self.start_layer = masa_start_layer
         self.recon_mask_threshold = mask_threshold
 
