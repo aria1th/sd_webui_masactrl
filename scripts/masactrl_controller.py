@@ -17,6 +17,7 @@ from einops import rearrange, repeat
 import os
 import math
 import numpy as np
+from scripts.reshape_utils import find_original_values, functional_reshape_values
 
 
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
@@ -148,7 +149,7 @@ class ProxyReconMasaSattn(object):
                 bg_attn_mask = torch.zeros_like(scaled_mask)
                 bg_attn_mask[scaled_mask >= masa_mask_threshold] = torch.finfo(masa_kv['k_in'].dtype).min
 
-                if sequence_length > 20000:
+                if sequence_length > 20000: 
                     fg_sattn_out = self.masa_split_sattn_forward(x, context, fg_attn_mask,
                                                                                  masa_kv['k_in'], masa_kv['v_in'])
                     bg_sattn_out = self.masa_split_sattn_forward(x, context, bg_attn_mask,
@@ -298,6 +299,9 @@ class ProxyReconMasaSattn(object):
             q, k, v = q.float(), k.float(), v.float()
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
+        # shape of q, k, v, mask should be same
+        q, k, v, mask = functional_reshape_values(q, k, v, mask)
+        #print(f'q shape:{q.shape}, k shape:{k.shape}, v shape:{v.shape}, mask shape:{mask.shape if mask is not None else None}')
         hidden_states = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
         )
@@ -700,6 +704,9 @@ class MasaController:
         self.recon_logged_sattn_kv_suite = {}
         self.foreground_indexes = [1]
         self.current_timestep_unet_pass = 0
+        
+        self.logged_h = 0
+        self.logged_w = 0
 
 
 
@@ -839,7 +846,14 @@ class MasaController:
                     attn_map = attn_map.mean(0)
                     # xattn_maps_of_interest[i] = attn_map
                     res_h, res_w = self.current_latent_size
-                    xattn_maps_of_interest[i] = attn_map.reshape(math.ceil(res_h/4), math.ceil(res_w/4))
+                    # 29, 19 is invalid for input of size 384 error
+                    #print(f'xattn map shape: {attn_map.shape}')
+                    #print(f'current latent size: {self.current_latent_size}')
+                    #print(f'target res: {math.ceil(res_h/4)}, {math.ceil(res_w/4)}')
+                    logged_h, logged_w = find_original_values(math.ceil(res_h/4), math.ceil(res_w/4), attn_map.shape[0])
+                    self.logged_h = logged_h
+                    self.logged_w = logged_w
+                    xattn_maps_of_interest[i] = attn_map.reshape(logged_h, logged_w)
 
                 attn_maps_aggregate = torch.stack(xattn_maps_of_interest, dim=0).mean(0)
 
@@ -880,7 +894,10 @@ class MasaController:
             self.unet_proxy.attach()
 
     def recon_params_init(self, masa_start_step, masa_start_layer,mask_threshold):
-        self.start_timestep = float(list(self.recon_averaged_xattn_map_reference.keys())[masa_start_step])
+        if len(self.recon_averaged_xattn_map_reference):
+            self.start_timestep = float(list(self.recon_averaged_xattn_map_reference.keys())[masa_start_step])
+        else:
+            self.start_timestep = 900.0
         self.start_layer = masa_start_layer
         self.recon_mask_threshold = mask_threshold
 
