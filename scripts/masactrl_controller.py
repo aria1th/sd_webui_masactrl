@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import enum
-from functools import reduce
 from inspect import isfunction
-
-from scripts.math_utils import get_closest_defactorization
 # from diffusers.utils import deprecate
 from ldm.modules.diffusionmodules.openaimodel import UNetModel
 import torch
@@ -809,7 +806,7 @@ class MasaController:
         return current_mask, current_kv, self.recon_mask_threshold
 
 
-    def masa_unet_signal(self, x, timesteps, is_hires:bool=False):
+    def masa_unet_signal(self, x, timesteps):
         last_timestep = self.current_timestep
         current_timestep = timesteps[0].item()
         if last_timestep == current_timestep:
